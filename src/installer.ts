@@ -2,293 +2,321 @@
 import * as core from '@actions/core';
 import * as exec from '@actions/exec';
 import * as io from '@actions/io';
-import hc = require('@actions/http-client');
+import * as hc from '@actions/http-client';
 import {chmodSync} from 'fs';
-import * as path from 'path';
-import {ExecOptions} from '@actions/exec/lib/interfaces';
-import * as semver from 'semver';
+import path from 'path';
+import os from 'os';
+import semver from 'semver';
+import {IS_WINDOWS, PLATFORM} from './utils';
+import {QualityOptions} from './setup-dotnet';
 
-const IS_WINDOWS = process.platform === 'win32';
-
-/**
- * Represents the inputted version information
- */
-export class DotNetVersionInfo {
-  public inputVersion: string;
-  private fullversion: string;
-  private isExactVersionSet: boolean = false;
-
-  constructor(version: string) {
-    this.inputVersion = version;
-
-    // Check for exact match
-    if (semver.valid(semver.clean(version) || '') != null) {
-      this.fullversion = semver.clean(version) as string;
-      this.isExactVersionSet = true;
-
-      return;
-    }
-
-    const parts: string[] = version.split('.');
-
-    if (parts.length < 2 || parts.length > 3) this.throwInvalidVersionFormat();
-
-    if (parts.length == 3 && parts[2] !== 'x' && parts[2] !== '*') {
-      this.throwInvalidVersionFormat();
-    }
-
-    const major = this.getVersionNumberOrThrow(parts[0]);
-    const minor = ['x', '*'].includes(parts[1])
-      ? parts[1]
-      : this.getVersionNumberOrThrow(parts[1]);
-
-    this.fullversion = major + '.' + minor;
-  }
-
-  private getVersionNumberOrThrow(input: string): number {
-    try {
-      if (!input || input.trim() === '') this.throwInvalidVersionFormat();
-
-      let number = Number(input);
-
-      if (Number.isNaN(number) || number < 0) this.throwInvalidVersionFormat();
-
-      return number;
-    } catch {
-      this.throwInvalidVersionFormat();
-      return -1;
-    }
-  }
-
-  private throwInvalidVersionFormat() {
-    throw new Error(
-      'Invalid version format! Supported: 1.2.3, 1.2, 1.2.x, 1.2.*'
-    );
-  }
-
-  /**
-   * If true exacatly one version should be resolved
-   */
-  public isExactVersion(): boolean {
-    return this.isExactVersionSet;
-  }
-
-  public version(): string {
-    return this.fullversion;
-  }
+export interface DotnetVersion {
+  type: string;
+  value: string;
+  qualityFlag: boolean;
 }
 
-export class DotnetCoreInstaller {
-  constructor(version: string, includePrerelease: boolean = false) {
-    this.version = version;
-    this.includePrerelease = includePrerelease;
+const QUALITY_INPUT_MINIMAL_MAJOR_TAG = 6;
+const LATEST_PATCH_SYNTAX_MINIMAL_MAJOR_TAG = 5;
+export class DotnetVersionResolver {
+  private inputVersion: string;
+  private resolvedArgument: DotnetVersion;
+
+  constructor(version: string) {
+    this.inputVersion = version.trim();
+    this.resolvedArgument = {type: '', value: '', qualityFlag: false};
   }
 
-  public async installDotnet() {
-    let output = '';
-    let resultCode = 0;
+  private async resolveVersionInput(): Promise<void> {
+    if (!semver.validRange(this.inputVersion) && !this.isLatestPatchSyntax()) {
+      throw new Error(
+        `The 'dotnet-version' was supplied in invalid format: ${this.inputVersion}! Supported syntax: A.B.C, A.B, A.B.x, A, A.x, A.B.Cxx`
+      );
+    }
+    if (semver.valid(this.inputVersion)) {
+      this.createVersionArgument();
+    } else {
+      await this.createChannelArgument();
+    }
+  }
 
-    let calculatedVersion = await this.resolveVersion(
-      new DotNetVersionInfo(this.version)
-    );
+  private isNumericTag(versionTag): boolean {
+    return /^\d+$/.test(versionTag);
+  }
 
-    var envVariables: {[key: string]: string} = {};
-    for (let key in process.env) {
-      if (process.env[key]) {
-        let value: any = process.env[key];
-        envVariables[key] = value;
-      }
+  private isLatestPatchSyntax() {
+    const majorTag = this.inputVersion.match(
+      /^(?<majorTag>\d+)\.\d+\.\d{1}x{2}$/
+    )?.groups?.majorTag;
+    if (
+      majorTag &&
+      parseInt(majorTag) < LATEST_PATCH_SYNTAX_MINIMAL_MAJOR_TAG
+    ) {
+      throw new Error(
+        `The 'dotnet-version' was supplied in invalid format: ${this.inputVersion}! The A.B.Cxx syntax is available since the .NET 5.0 release.`
+      );
+    }
+    return majorTag ? true : false;
+  }
+
+  private createVersionArgument() {
+    this.resolvedArgument.type = 'version';
+    this.resolvedArgument.value = this.inputVersion;
+  }
+
+  private async createChannelArgument() {
+    this.resolvedArgument.type = 'channel';
+    const [major, minor] = this.inputVersion.split('.');
+    if (this.isLatestPatchSyntax()) {
+      this.resolvedArgument.value = this.inputVersion;
+    } else if (this.isNumericTag(major) && this.isNumericTag(minor)) {
+      this.resolvedArgument.value = `${major}.${minor}`;
+    } else if (this.isNumericTag(major)) {
+      this.resolvedArgument.value = await this.getLatestByMajorTag(major);
+    } else {
+      // If "dotnet-version" is specified as *, x or X resolve latest version of .NET explicitly from LTS channel. The version argument will default to "latest" by install-dotnet script.
+      this.resolvedArgument.value = 'LTS';
+    }
+    this.resolvedArgument.qualityFlag =
+      parseInt(major) >= QUALITY_INPUT_MINIMAL_MAJOR_TAG ? true : false;
+  }
+
+  public async createDotnetVersion(): Promise<DotnetVersion> {
+    await this.resolveVersionInput();
+    if (!this.resolvedArgument.type) {
+      return this.resolvedArgument;
     }
     if (IS_WINDOWS) {
-      let escapedScript = path
-        .join(__dirname, '..', 'externals', 'install-dotnet.ps1')
-        .replace(/'/g, "''");
-      let command = `& '${escapedScript}'`;
-      if (calculatedVersion) {
-        command += ` -Version ${calculatedVersion}`;
-      }
-      if (process.env['https_proxy'] != null) {
-        command += ` -ProxyAddress ${process.env['https_proxy']}`;
-      }
-      // This is not currently an option
-      if (process.env['no_proxy'] != null) {
-        command += ` -ProxyBypassList ${process.env['no_proxy']}`;
-      }
-
-      // process.env must be explicitly passed in for DOTNET_INSTALL_DIR to be used
-      const powershellPath = await io.which('powershell', true);
-
-      var options: ExecOptions = {
-        listeners: {
-          stdout: (data: Buffer) => {
-            output += data.toString();
-          }
-        },
-        env: envVariables
-      };
-
-      resultCode = await exec.exec(
-        `"${powershellPath}"`,
-        [
-          '-NoLogo',
-          '-Sta',
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy',
-          'Unrestricted',
-          '-Command',
-          command
-        ],
-        options
-      );
+      this.resolvedArgument.type =
+        this.resolvedArgument.type === 'channel' ? '-Channel' : '-Version';
     } else {
-      let escapedScript = path
-        .join(__dirname, '..', 'externals', 'install-dotnet.sh')
-        .replace(/'/g, "''");
-      chmodSync(escapedScript, '777');
-
-      const scriptPath = await io.which(escapedScript, true);
-
-      let scriptArguments: string[] = [];
-      if (calculatedVersion) {
-        scriptArguments.push('--version', calculatedVersion);
-      }
-
-      // process.env must be explicitly passed in for DOTNET_INSTALL_DIR to be used
-      resultCode = await exec.exec(`"${scriptPath}"`, scriptArguments, {
-        listeners: {
-          stdout: (data: Buffer) => {
-            output += data.toString();
-          }
-        },
-        env: envVariables
-      });
+      this.resolvedArgument.type =
+        this.resolvedArgument.type === 'channel' ? '--channel' : '--version';
     }
-
-    if (process.env['DOTNET_INSTALL_DIR']) {
-      core.addPath(process.env['DOTNET_INSTALL_DIR']);
-      core.exportVariable('DOTNET_ROOT', process.env['DOTNET_INSTALL_DIR']);
-    } else {
-      if (IS_WINDOWS) {
-        // This is the default set in install-dotnet.ps1
-        core.addPath(
-          path.join(process.env['LocalAppData'] + '', 'Microsoft', 'dotnet')
-        );
-        core.exportVariable(
-          'DOTNET_ROOT',
-          path.join(process.env['LocalAppData'] + '', 'Microsoft', 'dotnet')
-        );
-      } else {
-        // This is the default set in install-dotnet.sh
-        core.addPath(path.join(process.env['HOME'] + '', '.dotnet'));
-        core.exportVariable(
-          'DOTNET_ROOT',
-          path.join(process.env['HOME'] + '', '.dotnet')
-        );
-      }
-    }
-
-    console.log(process.env['PATH']);
-
-    if (resultCode != 0) {
-      throw new Error(`Failed to install dotnet ${resultCode}. ${output}`);
-    }
+    return this.resolvedArgument;
   }
 
-  // versionInfo - versionInfo of the SDK/Runtime
-  async resolveVersion(versionInfo: DotNetVersionInfo): Promise<string> {
-    if (versionInfo.isExactVersion()) {
-      return versionInfo.version();
-    }
-
+  private async getLatestByMajorTag(majorTag: string): Promise<string> {
     const httpClient = new hc.HttpClient('actions/setup-dotnet', [], {
       allowRetries: true,
       maxRetries: 3
     });
-
-    const releasesJsonUrl: string = await this.getReleasesJsonUrl(
-      httpClient,
-      versionInfo.version().split('.')
+    const response = await httpClient.getJson<any>(
+      DotnetVersionResolver.DotnetCoreIndexUrl
     );
-
-    const releasesResponse = await httpClient.getJson<any>(releasesJsonUrl);
-    const releasesResult = releasesResponse.result || {};
-    let releasesInfo: any[] = releasesResult['releases'];
-    releasesInfo = releasesInfo.filter((releaseInfo: any) => {
-      return (
-        semver.satisfies(releaseInfo['sdk']['version'], versionInfo.version(), {
-          includePrerelease: this.includePrerelease
-        }) ||
-        semver.satisfies(
-          releaseInfo['sdk']['version-display'],
-          versionInfo.version(),
-          {
-            includePrerelease: this.includePrerelease
-          }
-        )
-      );
-    });
-
-    // Exclude versions that are newer than the latest if using not exact
-    let latestSdk: string = releasesResult['latest-sdk'];
-
-    releasesInfo = releasesInfo.filter((releaseInfo: any) =>
-      semver.lte(releaseInfo['sdk']['version'], latestSdk, {
-        includePrerelease: this.includePrerelease
-      })
-    );
-
-    // Sort for latest version
-    releasesInfo = releasesInfo.sort((a, b) =>
-      semver.rcompare(a['sdk']['version'], b['sdk']['version'], {
-        includePrerelease: this.includePrerelease
-      })
-    );
-
-    if (releasesInfo.length == 0) {
-      throw new Error(
-        `Could not find dotnet core version. Please ensure that specified version ${versionInfo.inputVersion} is valid.`
-      );
-    }
-
-    let release = releasesInfo[0];
-    return release['sdk']['version'];
-  }
-
-  private async getReleasesJsonUrl(
-    httpClient: hc.HttpClient,
-    versionParts: string[]
-  ): Promise<string> {
-    const response = await httpClient.getJson<any>(DotNetCoreIndexUrl);
     const result = response.result || {};
-    let releasesInfo: any[] = result['releases-index'];
+    const releasesInfo: any[] = result['releases-index'];
 
-    releasesInfo = releasesInfo.filter((info: any) => {
-      // channel-version is the first 2 elements of the version (e.g. 2.1), filter out versions that don't match 2.1.x.
+    const releaseInfo = releasesInfo.find(info => {
       const sdkParts: string[] = info['channel-version'].split('.');
-      if (
-        versionParts.length >= 2 &&
-        !(versionParts[1] == 'x' || versionParts[1] == '*')
-      ) {
-        return versionParts[0] == sdkParts[0] && versionParts[1] == sdkParts[1];
-      }
-      return versionParts[0] == sdkParts[0];
+      return sdkParts[0] === majorTag;
     });
 
-    if (releasesInfo.length === 0) {
+    if (!releaseInfo) {
       throw new Error(
-        `Could not find info for version ${versionParts.join(
-          '.'
-        )} at ${DotNetCoreIndexUrl}`
+        `Could not find info for version with major tag: "${majorTag}" at ${DotnetVersionResolver.DotnetCoreIndexUrl}`
       );
     }
 
-    return releasesInfo[0]['releases.json'];
+    return releaseInfo['channel-version'];
   }
 
-  private version: string;
-  private includePrerelease: boolean;
+  static DotnetCoreIndexUrl =
+    'https://dotnetcli.azureedge.net/dotnet/release-metadata/releases-index.json';
 }
 
-const DotNetCoreIndexUrl: string =
-  'https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json';
+export class DotnetInstallScript {
+  private scriptName = IS_WINDOWS ? 'install-dotnet.ps1' : 'install-dotnet.sh';
+  private escapedScript: string;
+  private scriptArguments: string[] = [];
+
+  constructor() {
+    this.escapedScript = path
+      .join(__dirname, '..', '..', 'externals', this.scriptName)
+      .replace(/'/g, "''");
+
+    if (IS_WINDOWS) {
+      this.setupScriptPowershell();
+      return;
+    }
+
+    this.setupScriptBash();
+  }
+
+  private setupScriptPowershell() {
+    this.scriptArguments = [
+      '-NoLogo',
+      '-Sta',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Unrestricted',
+      '-Command'
+    ];
+
+    this.scriptArguments.push('&', `'${this.escapedScript}'`);
+
+    if (process.env['https_proxy'] != null) {
+      this.scriptArguments.push(`-ProxyAddress ${process.env['https_proxy']}`);
+    }
+    // This is not currently an option
+    if (process.env['no_proxy'] != null) {
+      this.scriptArguments.push(`-ProxyBypassList ${process.env['no_proxy']}`);
+    }
+  }
+
+  private setupScriptBash() {
+    chmodSync(this.escapedScript, '777');
+  }
+
+  private async getScriptPath() {
+    if (IS_WINDOWS) {
+      return (await io.which('pwsh', false)) || io.which('powershell', true);
+    }
+
+    return io.which(this.escapedScript, true);
+  }
+
+  public useArguments(...args: string[]) {
+    this.scriptArguments.push(...args);
+    return this;
+  }
+
+  public useVersion(dotnetVersion: DotnetVersion, quality?: QualityOptions) {
+    if (dotnetVersion.type) {
+      this.useArguments(dotnetVersion.type, dotnetVersion.value);
+    }
+
+    if (quality && !dotnetVersion.qualityFlag) {
+      core.warning(
+        `The 'dotnet-quality' input can be used only with .NET SDK version in A.B, A.B.x, A, A.x and A.B.Cxx formats where the major tag is higher than 5. You specified: ${dotnetVersion.value}. 'dotnet-quality' input is ignored.`
+      );
+      return this;
+    }
+
+    if (quality) {
+      this.useArguments(IS_WINDOWS ? '-Quality' : '--quality', quality);
+    }
+
+    return this;
+  }
+
+  public async execute() {
+    const getExecOutputOptions = {
+      ignoreReturnCode: true,
+      env: process.env as {string: string}
+    };
+
+    return exec.getExecOutput(
+      `"${await this.getScriptPath()}"`,
+      this.scriptArguments,
+      getExecOutputOptions
+    );
+  }
+}
+
+export abstract class DotnetInstallDir {
+  private static readonly default = {
+    linux: '/usr/share/dotnet',
+    mac: path.join(process.env['HOME'] + '', '.dotnet'),
+    windows: path.join(process.env['PROGRAMFILES'] + '', 'dotnet')
+  };
+
+  public static readonly dirPath = process.env['DOTNET_INSTALL_DIR']
+    ? DotnetInstallDir.convertInstallPathToAbsolute(
+        process.env['DOTNET_INSTALL_DIR']
+      )
+    : DotnetInstallDir.default[PLATFORM];
+
+  private static convertInstallPathToAbsolute(installDir: string): string {
+    if (path.isAbsolute(installDir)) return path.normalize(installDir);
+
+    const transformedPath = installDir.startsWith('~')
+      ? path.join(os.homedir(), installDir.slice(1))
+      : path.join(process.cwd(), installDir);
+
+    return path.normalize(transformedPath);
+  }
+
+  public static addToPath() {
+    core.addPath(process.env['DOTNET_INSTALL_DIR']!);
+    core.exportVariable('DOTNET_ROOT', process.env['DOTNET_INSTALL_DIR']);
+  }
+
+  public static setEnvironmentVariable() {
+    process.env['DOTNET_INSTALL_DIR'] = DotnetInstallDir.dirPath;
+  }
+}
+
+export class DotnetCoreInstaller {
+  static {
+    DotnetInstallDir.setEnvironmentVariable();
+  }
+
+  constructor(
+    private version: string,
+    private quality: QualityOptions
+  ) {}
+
+  public async installDotnet(): Promise<string | null> {
+    const versionResolver = new DotnetVersionResolver(this.version);
+    const dotnetVersion = await versionResolver.createDotnetVersion();
+
+    /**
+     * Install dotnet runitme first in order to get
+     * the latest stable version of dotnet CLI
+     */
+    const runtimeInstallOutput = await new DotnetInstallScript()
+      // If dotnet CLI is already installed - avoid overwriting it
+      .useArguments(
+        IS_WINDOWS ? '-SkipNonVersionedFiles' : '--skip-non-versioned-files'
+      )
+      // Install only runtime + CLI
+      .useArguments(IS_WINDOWS ? '-Runtime' : '--runtime', 'dotnet')
+      // Use latest stable version
+      .useArguments(IS_WINDOWS ? '-Channel' : '--channel', 'LTS')
+      .execute();
+
+    if (runtimeInstallOutput.exitCode) {
+      /**
+       * dotnetInstallScript will install CLI and runtime even if previous script haven't succeded,
+       * so at this point it's too early to throw an error
+       */
+      core.warning(
+        `Failed to install dotnet runtime + cli, exit code: ${runtimeInstallOutput.exitCode}. ${runtimeInstallOutput.stderr}`
+      );
+    }
+
+    /**
+     * Install dotnet over the latest version of
+     * dotnet CLI
+     */
+    const dotnetInstallOutput = await new DotnetInstallScript()
+      // Don't overwrite CLI because it should be already installed
+      .useArguments(
+        IS_WINDOWS ? '-SkipNonVersionedFiles' : '--skip-non-versioned-files'
+      )
+      // Use version provided by user
+      .useVersion(dotnetVersion, this.quality)
+      .execute();
+
+    if (dotnetInstallOutput.exitCode) {
+      throw new Error(
+        `Failed to install dotnet, exit code: ${dotnetInstallOutput.exitCode}. ${dotnetInstallOutput.stderr}`
+      );
+    }
+
+    return this.parseInstalledVersion(dotnetInstallOutput.stdout);
+  }
+
+  private parseInstalledVersion(stdout: string): string | null {
+    const regex = /(?<version>\d+\.\d+\.\d+[a-z0-9._-]*)/gm;
+    const matchedResult = regex.exec(stdout);
+
+    if (!matchedResult) {
+      core.warning(`Failed to parse installed by the script version of .NET`);
+      return null;
+    }
+    return matchedResult.groups!.version;
+  }
+}
